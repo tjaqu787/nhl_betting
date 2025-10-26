@@ -1,4 +1,4 @@
 data/nhl_data.db
-data/__pycache__/data_preprocessor.cpython-312.pyc
-models/__pycache__/model.cpython-312.pyc
-utils/__pycache__/training.cpython-312.pyc
+data/__pycache__/*
+models/__pycache__/*
+utils/__pycache__/*
