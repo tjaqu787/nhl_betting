@@ -1,72 +1,144 @@
 """
-Complete Training Pipeline with Data Processing
-Handles real NBA/sports data → features → training → backtesting
+NHL Data Preprocessing Pipeline
+Handles real NHL data from database → features → training
+Uses actual database schema with teams, games, player_game_stats, etc.
 """
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+import sqlite3
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
-import json
+from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
-from utils.training import TrainingOrchestrator
+# Import query functions
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from data.queries import (
+    get_training_data,
+    get_team_rolling_window,
+    get_player_rolling_window,
+    get_team_game_rolling_window,
+    get_h2h_rolling_window,
+    get_rest_days_rolling_window,
+    db_path
+)
+
 
 # ============================================================================
-# 1. DATA PREPROCESSING PIPELINE
+# 1. NHL DATA PREPROCESSOR
 # ============================================================================
 
-class SportsDataPreprocessor:
+class NHLDataPreprocessor:
     """
-    Converts raw game logs into model-ready features.
-    Handles: player stats, lineups, temporal sequences, edges.
+    Converts raw NHL game data into model-ready features.
+    Handles: player stats, lineups, temporal sequences, team features.
     """
-    def __init__(self):
-        self.player_id_map = {}  # name -> integer ID
-        self.team_id_map = {}
-        self.position_map = {'PG': 0, 'SG': 1, 'SF': 2, 'PF': 3, 'C': 4}
+    def __init__(self, db_path: str = "nhl_data.db"):
+        self.db_path = db_path
+        self.conn = None
         
-        self.player_history = defaultdict(list)  # rolling stats per player
-        self.lineup_coplay = defaultdict(lambda: defaultdict(int))  # minutes together
+        # Mappings
+        self.player_id_map = {}  # player_id -> integer index
+        self.team_id_map = {}    # team_abbrev -> integer index
+        self.position_map = {'C': 0, 'L': 1, 'R': 2, 'D': 3, 'G': 4}  # Center, Left, Right, Defense, Goalie
         
-    def fit_player_vocab(self, game_logs: pd.DataFrame):
-        """Build player ID vocabulary from historical data."""
-        unique_players = set()
+        # Cache for player/team data
+        self.player_cache = {}
+        self.team_cache = {}
         
-        for col in ['home_player_1', 'home_player_2', 'home_player_3', 
-                    'home_player_4', 'home_player_5',
-                    'away_player_1', 'away_player_2', 'away_player_3',
-                    'away_player_4', 'away_player_5']:
-            if col in game_logs.columns:
-                unique_players.update(game_logs[col].dropna().unique())
+    def connect(self):
+        """Open database connection"""
+        if self.conn is None:
+            self.conn = sqlite3.connect(self.db_path)
+    
+    def close(self):
+        """Close database connection"""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+    
+    def fit_player_vocab(self, min_games: int = 5):
+        """
+        Build player ID vocabulary from database.
+        Only include players with minimum number of games.
+        """
+        self.connect()
         
-        # Assign IDs (0 reserved for unknown/average player)
+        query = """
+        SELECT DISTINCT player_id, COUNT(*) as games
+        FROM player_game_stats
+        GROUP BY player_id
+        HAVING games >= ?
+        ORDER BY games DESC
+        """
+        
+        df = pd.read_sql_query(query, self.conn, params=(min_games,))
+        
+        # Assign IDs (0 reserved for unknown/replacement player)
         self.player_id_map = {
-            player: idx + 1 
-            for idx, player in enumerate(sorted(unique_players))
+            int(player_id): idx + 1 
+            for idx, player_id in enumerate(df['player_id'])
         }
-        self.player_id_map['<UNKNOWN>'] = 0
+        self.player_id_map[0] = 0  # Unknown player
         
-        print(f"Mapped {len(self.player_id_map)} players")
+        print(f"✓ Mapped {len(self.player_id_map)} players (min {min_games} games)")
         
-    def compute_player_features(self, player_name: str, game_date: datetime,
-                                recent_games: pd.DataFrame) -> np.ndarray:
+        # Also build team mapping
+        team_query = "SELECT DISTINCT team_abbrev FROM teams ORDER BY team_abbrev"
+        teams = pd.read_sql_query(team_query, self.conn)
+        
+        self.team_id_map = {
+            team: idx 
+            for idx, team in enumerate(teams['team_abbrev'])
+        }
+        
+        print(f"✓ Mapped {len(self.team_id_map)} teams")
+    
+    def get_team_roster(self, team_abbrev: str, game_date: str, 
+                       lookback_days: int = 30) -> List[int]:
+        """
+        Get active roster for a team around a specific date.
+        Returns list of player_ids.
+        """
+        self.connect()
+        
+        # Get players who played for this team recently
+        start_date = (pd.to_datetime(game_date) - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
+        
+        query = """
+        SELECT DISTINCT pgs.player_id, COUNT(*) as games
+        FROM player_game_stats pgs
+        JOIN games g ON pgs.game_id = g.game_id
+        WHERE pgs.team_abbrev = ?
+        AND g.game_date <= ?
+        AND g.game_date >= ?
+        AND g.game_state IN ('OFF', 'FINAL')
+        GROUP BY pgs.player_id
+        ORDER BY games DESC
+        LIMIT 20
+        """
+        
+        df = pd.read_sql_query(query, self.conn, params=(team_abbrev, game_date, start_date))
+        
+        return df['player_id'].tolist()
+    
+    def compute_player_features(self, player_id: int, game_date: str,
+                                lookback_games: int = 10) -> np.ndarray:
         """
         Compute per-player features from recent history.
         
         Returns: [feat_dim] array with:
-          - Per-minute stats (PTS, REB, AST, etc.)
-          - Usage rate
-          - Efficiency metrics
-          - Fatigue proxies
-          - Opponent matchup history
+          - Per-game stats (goals, assists, points, shots, +/-, TOI)
+          - Efficiency metrics (shooting %, points per 60)
+          - Special teams stats (PP goals, SH goals)
+          - Physical stats (hits, blocks)
+          - Recent form trend
+          - Position encoding
         """
-        # Filter to player's recent games before this date
-        player_games = recent_games[
-            (recent_games['player_name'] == player_name) &
-            (recent_games['game_date'] < game_date)
-        ].sort_values('game_date', ascending=False).head(10)
+        # Get recent games for this player
+        player_games = get_player_rolling_window(player_id, game_date, lookback_games)
         
         if len(player_games) == 0:
             # Cold start - return zeros
@@ -74,355 +146,401 @@ class SportsDataPreprocessor:
         
         features = []
         
-        # Last 10 games averages (per 36 minutes)
-        features.append(player_games['points'].mean() * 36 / (player_games['minutes'].mean() + 1))
-        features.append(player_games['rebounds'].mean() * 36 / (player_games['minutes'].mean() + 1))
-        features.append(player_games['assists'].mean() * 36 / (player_games['minutes'].mean() + 1))
-        features.append(player_games['steals'].mean() * 36 / (player_games['minutes'].mean() + 1))
-        features.append(player_games['blocks'].mean() * 36 / (player_games['minutes'].mean() + 1))
-        features.append(player_games['turnovers'].mean() * 36 / (player_games['minutes'].mean() + 1))
-        features.append(player_games['fg_pct'].mean())
-        features.append(player_games['three_pct'].mean())
-        features.append(player_games['ft_pct'].mean())
+        # Basic stats (per game averages)
+        features.append(player_games['goals'].mean())
+        features.append(player_games['assists'].mean())
+        features.append(player_games['points'].mean())
+        features.append(player_games['shots'].mean())
+        features.append(player_games['plus_minus'].mean())
         
-        # Usage rate
-        features.append(player_games['usage_rate'].mean())
+        # Time on ice (convert MM:SS to minutes if needed)
+        toi_values = []
+        for toi in player_games['toi']:
+            if toi and isinstance(toi, str) and ':' in toi:
+                parts = toi.split(':')
+                minutes = int(parts[0]) + int(parts[1]) / 60.0
+                toi_values.append(minutes)
+            elif toi:
+                toi_values.append(float(toi))
+        
+        avg_toi = np.mean(toi_values) if toi_values else 15.0
+        features.append(avg_toi)
         
         # Efficiency metrics
-        features.append(player_games['plus_minus'].mean())
-        features.append(player_games['per'].mean())  # Player Efficiency Rating
+        total_shots = player_games['shots'].sum()
+        shooting_pct = player_games['goals'].sum() / max(total_shots, 1)
+        features.append(shooting_pct)
+        
+        # Points per 60 minutes
+        total_toi = sum(toi_values) if toi_values else 1.0
+        points_per_60 = player_games['points'].sum() / max(total_toi / 60.0, 0.1)
+        features.append(points_per_60)
+        
+        # Special teams
+        features.append(player_games['powerplay_goals'].mean())
+        
+        # Physical play
+        features.append(player_games['hits'].mean())
+        features.append(player_games['blocked'].mean())
         
         # Recent form (last 3 games vs last 10 games)
-        recent_3 = player_games.head(3)['points'].mean()
-        recent_10 = player_games['points'].mean()
-        features.append((recent_3 - recent_10) / (recent_10 + 1))  # Form trend
-        
-        # Fatigue proxies
-        features.append(player_games.head(3)['minutes'].sum())  # Last 3 games minutes
-        features.append(player_games.head(7)['minutes'].sum())  # Last 7 games minutes
-        
-        # Days rest
-        if len(player_games) >= 2:
-            last_game_date = player_games.iloc[0]['game_date']
-            days_rest = (game_date - last_game_date).days
-            features.append(min(days_rest, 7))  # Cap at 7
+        if len(player_games) >= 3:
+            recent_3_pts = player_games.head(3)['points'].mean()
+            all_pts = player_games['points'].mean()
+            form_trend = (recent_3_pts - all_pts) / (all_pts + 0.1)
         else:
-            features.append(3)  # Default
+            form_trend = 0.0
+        features.append(form_trend)
         
-        # Home/away splits (if available)
-        home_games = player_games[player_games['home_away'] == 'home']
-        away_games = player_games[player_games['home_away'] == 'away']
-        features.append(home_games['plus_minus'].mean() if len(home_games) > 0 else 0)
-        features.append(away_games['plus_minus'].mean() if len(away_games) > 0 else 0)
+        # Consistency (std dev of points)
+        features.append(player_games['points'].std())
         
-        # Position encoding (one-hot flattened)
-        position = player_games.iloc[0].get('position', 'SF')
-        pos_vector = [0] * 5
-        pos_vector[self.position_map.get(position, 2)] = 1
+        # Games played (as proxy for fatigue/availability)
+        features.append(min(len(player_games) / 10.0, 1.0))
+        
+        # Position encoding (one-hot)
+        if len(player_games) > 0:
+            position = player_games.iloc[0]['position']
+            # Extract first character (C, L, R, D, G)
+            pos_char = position[0] if position else 'C'
+            pos_idx = self.position_map.get(pos_char, 0)
+        else:
+            pos_idx = 0
+        
+        pos_vector = [0.0] * 5
+        pos_vector[pos_idx] = 1.0
         features.extend(pos_vector)
         
-        # Pad to fixed size
+        # Recent shot volume (indicator of offensive role)
+        features.append(player_games.head(5)['shots'].sum())
+        
+        # Plus/minus trend
+        if len(player_games) >= 5:
+            recent_pm = player_games.head(5)['plus_minus'].mean()
+            overall_pm = player_games['plus_minus'].mean()
+            pm_trend = recent_pm - overall_pm
+        else:
+            pm_trend = 0.0
+        features.append(pm_trend)
+        
+        # Pad or truncate to fixed size
         features = features[:32]
         while len(features) < 32:
             features.append(0.0)
         
         return np.array(features, dtype=np.float32)
     
-    def compute_temporal_history(self, player_name: str, game_date: datetime,
-                                 recent_games: pd.DataFrame, 
-                                 seq_len: int = 10) -> np.ndarray:
+    def compute_temporal_history(self, player_id: int, game_date: str,
+                                 lookback_games: int = 10) -> np.ndarray:
         """
-        Get sequence of features for last N games (for GRU).
+        Get sequence of features for last N games (for GRU/LSTM).
         Returns: [seq_len, feat_dim]
         """
-        player_games = recent_games[
-            (recent_games['player_name'] == player_name) &
-            (recent_games['game_date'] < game_date)
-        ].sort_values('game_date', ascending=False).head(seq_len)
+        player_games = get_player_rolling_window(player_id, game_date, lookback_games)
         
         history = []
         for _, game in player_games.iterrows():
+            # Convert TOI to float
+            toi = game['toi']
+            if toi and isinstance(toi, str) and ':' in toi:
+                parts = toi.split(':')
+                toi_minutes = int(parts[0]) + int(parts[1]) / 60.0
+            else:
+                toi_minutes = 15.0
+            
             game_features = [
-                game['points'], game['rebounds'], game['assists'],
-                game['minutes'], game['plus_minus'], game['fg_pct'],
-                game.get('usage_rate', 0.2), game.get('per', 15.0)
+                game['goals'],
+                game['assists'],
+                game['points'],
+                game['shots'],
+                game['plus_minus'],
+                toi_minutes,
+                game['powerplay_goals'],
+                game['hits'],
+                game['blocked']
             ]
+            
             # Pad to 32
             game_features.extend([0.0] * (32 - len(game_features)))
             history.append(game_features[:32])
         
         # Pad sequence if needed
-        while len(history) < seq_len:
+        while len(history) < lookback_games:
             history.append([0.0] * 32)
         
         return np.array(history, dtype=np.float32)
     
-    def compute_edge_features(self, lineup_players: List[str],
-                                 coplay_stats: Dict) -> np.ndarray:
+    def compute_team_features(self, team_abbrev: str, game_date: str,
+                             lookback_games: int = 10) -> np.ndarray:
         """
-        Compute edge features for lineup graph (co-play time, chemistry).
-        Returns: [num_players, num_players, edge_dim]
-        """
-        num_players = len(lineup_players)
-        edge_features = np.zeros((num_players, num_players, 8), dtype=np.float32)
+        Compute team-level features from recent performance.
         
-        for i, player_i in enumerate(lineup_players):
-            for j, player_j in enumerate(lineup_players):
-                if i == j:
-                    continue
-                
-                # Co-play minutes this season
-                coplay_key = tuple(sorted([player_i, player_j]))
-                coplay_min = coplay_stats.get(coplay_key, {}).get('minutes', 0)
-                edge_features[i, j, 0] = min(coplay_min / 1000.0, 1.0)  # Normalize
-                
-                # Net rating when together
-                edge_features[i, j, 1] = coplay_stats.get(coplay_key, {}).get('net_rating', 0) / 20.0
-                
-                # On-court vs off-court differential
-                edge_features[i, j, 2] = coplay_stats.get(coplay_key, {}).get('on_off_diff', 0) / 10.0
-                
-                # Offensive synergy
-                edge_features[i, j, 3] = coplay_stats.get(coplay_key, {}).get('off_rating', 110) / 120.0
-                
-                # Defensive synergy
-                edge_features[i, j, 4] = coplay_stats.get(coplay_key, {}).get('def_rating', 110) / 120.0
-                
-                # Pace when together
-                edge_features[i, j, 5] = coplay_stats.get(coplay_key, {}).get('pace', 100) / 110.0
-                
-                # Position compatibility (guards + bigs = good spacing)
-                pos_i = self._get_position_type(player_i)
-                pos_j = self._get_position_type(player_j)
-                edge_features[i, j, 6] = float(pos_i != pos_j)  # Different positions
-                
-                # Recent co-play (last 5 games)
-                edge_features[i, j, 7] = coplay_stats.get(coplay_key, {}).get('recent_minutes', 0) / 200.0
-        
-        return edge_features
-    
-    def _get_position_type(self, player_name: str) -> str:
-        """Guard vs Big classification."""
-        # Simplified - in production, use actual position data
-        return 'guard' if hash(player_name) % 2 == 0 else 'big'
-    
-    def extract_market_features(self, game_row: pd.Series) -> np.ndarray:
+        Returns: [team_feat_dim] with:
+          - Win percentage
+          - Goals for/against
+          - Shot metrics
+          - Special teams efficiency
+          - Recent form
         """
-        Extract bookmaker line features.
+        team_games = get_team_rolling_window(team_abbrev, game_date, lookback_games)
         
-        Returns: [market_dim] with:
-          - Opening spread, current spread, line movement
-          - Opening total, current total, total movement
-          - Moneyline odds (both sides)
-          - Public betting percentages
-          - Sharp money indicators
-          - Market consensus
-        """
+        if len(team_games) == 0:
+            return np.zeros(24)
+        
         features = []
         
-        # Spread features
-        opening_spread = game_row.get('opening_spread', 0.0)
-        current_spread = game_row.get('current_spread', 0.0)
-        features.append(current_spread)
-        features.append(opening_spread)
-        features.append(current_spread - opening_spread)  # Movement
+        # Win rate
+        features.append(team_games['win'].mean())
         
-        # Total features
-        opening_total = game_row.get('opening_total', 220.0)
-        current_total = game_row.get('current_total', 220.0)
-        features.append(current_total / 250.0)  # Normalize
-        features.append(opening_total / 250.0)
-        features.append((current_total - opening_total) / 10.0)
+        # Scoring
+        features.append(team_games['goals_for'].mean())
+        features.append(team_games['goals_against'].mean())
+        features.append(team_games['goal_differential'].mean())
         
-        # Moneyline odds (convert to implied probability)
-        home_ml = game_row.get('home_moneyline', -110)
-        away_ml = game_row.get('away_moneyline', -110)
-        home_implied = self._moneyline_to_prob(home_ml)
-        away_implied = self._moneyline_to_prob(away_ml)
-        features.append(home_implied)
-        features.append(away_implied)
+        # Shot metrics
+        features.append(team_games['shots_for'].mean())
+        features.append(team_games['shots_against'].mean())
+        features.append(team_games['shooting_pct'].mean())
+        features.append(team_games['save_pct'].mean())
         
-        # Public betting percentages
-        features.append(game_row.get('public_bet_pct_home', 0.5))
-        features.append(game_row.get('public_money_pct_home', 0.5))
+        # Home/away splits
+        home_games = team_games[team_games['is_home'] == 1]
+        away_games = team_games[team_games['is_home'] == 0]
         
-        # Sharp money indicators (reverse line movement)
-        public_on_home = game_row.get('public_bet_pct_home', 0.5) > 0.65
-        line_moved_away = (current_spread - opening_spread) < -0.5
-        features.append(float(public_on_home and line_moved_away))  # RLM signal
+        features.append(home_games['win'].mean() if len(home_games) > 0 else 0.5)
+        features.append(away_games['win'].mean() if len(away_games) > 0 else 0.5)
         
-        # Market consensus (average across multiple books)
-        features.append(game_row.get('consensus_spread', current_spread))
-        features.append(game_row.get('spread_std', 0.5))  # Disagreement
+        # Recent form (last 5 games)
+        if len(team_games) >= 5:
+            recent_5_wins = team_games.head(5)['win'].sum()
+            features.append(recent_5_wins / 5.0)
+        else:
+            features.append(0.5)
         
-        # Time until game (urgency)
-        features.append(game_row.get('hours_until_game', 24.0) / 48.0)
+        # Goal differential trend
+        if len(team_games) >= 5:
+            recent_gd = team_games.head(5)['goal_differential'].mean()
+            overall_gd = team_games['goal_differential'].mean()
+            gd_trend = recent_gd - overall_gd
+        else:
+            gd_trend = 0.0
+        features.append(gd_trend)
         
-        # Pad to 16 features
-        while len(features) < 16:
+        # Consistency (std of goals)
+        features.append(team_games['goals_for'].std())
+        features.append(team_games['goals_against'].std())
+        
+        # Get team_game_stats for more detailed metrics
+        team_game_stats = get_team_game_rolling_window(team_abbrev, game_date, lookback_games)
+        
+        if len(team_game_stats) > 0:
+            # Power play efficiency
+            pp_goals = team_game_stats['powerplay_goals'].sum()
+            pp_opps = team_game_stats['powerplay_opportunities'].sum()
+            pp_pct = pp_goals / max(pp_opps, 1)
+            features.append(pp_pct)
+            
+            # Faceoff win percentage
+            features.append(team_game_stats['faceoff_win_pct'].mean())
+            
+            # Physical metrics
+            features.append(team_game_stats['hits'].mean())
+            features.append(team_game_stats['blocked'].mean())
+            
+            # Discipline (penalty minutes)
+            features.append(team_game_stats['pim'].mean())
+            
+            # Possession metrics
+            features.append(team_game_stats['giveaways'].mean())
+            features.append(team_game_stats['takeaways'].mean())
+        else:
+            # Default values
+            features.extend([0.2, 0.5, 20.0, 15.0, 8.0, 8.0, 8.0])
+        
+        # Pad to 24
+        features = features[:24]
+        while len(features) < 24:
             features.append(0.0)
         
-        return np.array(features[:16], dtype=np.float32)
+        return np.array(features, dtype=np.float32)
     
-    def _moneyline_to_prob(self, moneyline: float) -> float:
-        """Convert American odds to implied probability."""
-        if moneyline > 0:
-            return 100.0 / (moneyline + 100.0)
-        else:
-            return abs(moneyline) / (abs(moneyline) + 100.0)
-    
-    def extract_context_features(self, game_row: pd.Series) -> np.ndarray:
+    def compute_context_features(self, game_row: pd.Series) -> np.ndarray:
         """
-        Game context features: home/away, rest, travel, schedule, motivation.
+        Game context features: home/away, rest, head-to-head, schedule position.
         Returns: [24]
         """
         features = []
         
-        # Home court advantage (binary + strength)
-        features.append(1.0)  # Home team perspective
-        home_record = game_row.get('home_record_home', 0.5)
-        features.append(home_record)
+        # Home advantage (always 1.0 for home team perspective)
+        features.append(1.0)
         
-        # Rest days for each team
-        home_rest = game_row.get('home_days_rest', 2)
-        away_rest = game_row.get('away_days_rest', 2)
-        features.append(min(home_rest, 7) / 7.0)
-        features.append(min(away_rest, 7) / 7.0)
+        # Rest days
+        game_id = game_row['game_id']
+        home_team = game_row['home_team']
+        away_team = game_row['away_team']
+        game_date = game_row['game_date']
+        
+        # Get rest days from database
+        self.connect()
+        rest_query = """
+        SELECT rest_days 
+        FROM team_rest_days 
+        WHERE team = ? AND game_id = ?
+        """
+        
+        home_rest = pd.read_sql_query(rest_query, self.conn, 
+                                       params=(home_team, game_id))
+        away_rest = pd.read_sql_query(rest_query, self.conn,
+                                       params=(away_team, game_id))
+        
+        home_rest_days = home_rest['rest_days'].iloc[0] if len(home_rest) > 0 else 2
+        away_rest_days = away_rest['rest_days'].iloc[0] if len(away_rest) > 0 else 2
+        
+        features.append(min(home_rest_days / 7.0, 1.0) if home_rest_days else 0.3)
+        features.append(min(away_rest_days / 7.0, 1.0) if away_rest_days else 0.3)
         
         # Back-to-back flags
-        features.append(float(home_rest == 0))
-        features.append(float(away_rest == 0))
+        features.append(1.0 if home_rest_days == 1 else 0.0)
+        features.append(1.0 if away_rest_days == 1 else 0.0)
         
-        # Travel distance for away team
-        travel_miles = game_row.get('away_travel_miles', 1000)
-        features.append(min(travel_miles / 3000.0, 1.0))
+        # Head-to-head record
+        h2h = get_h2h_rolling_window(home_team, away_team, game_date, lookback_games=10)
         
-        # Schedule position (games played / total games)
-        home_games_played = game_row.get('home_games_played', 41)
-        away_games_played = game_row.get('away_games_played', 41)
+        if len(h2h) > 0:
+            home_h2h_wins = h2h[h2h['team'] == home_team]['win'].sum()
+            away_h2h_wins = h2h[h2h['team'] == away_team]['win'].sum()
+            total_h2h = len(h2h)
+            
+            features.append(home_h2h_wins / max(total_h2h, 1))
+            features.append(away_h2h_wins / max(total_h2h, 1))
+        else:
+            features.extend([0.5, 0.5])
+        
+        # Season progress (games played / 82)
+        games_query = """
+        SELECT COUNT(*) as games
+        FROM games g
+        WHERE (g.home_team = ? OR g.away_team = ?)
+        AND g.game_date < ?
+        AND g.game_state IN ('OFF', 'FINAL')
+        """
+        
+        home_games = pd.read_sql_query(games_query, self.conn,
+                                        params=(home_team, home_team, game_date))
+        away_games = pd.read_sql_query(games_query, self.conn,
+                                        params=(away_team, away_team, game_date))
+        
+        home_games_played = home_games['games'].iloc[0] if len(home_games) > 0 else 0
+        away_games_played = away_games['games'].iloc[0] if len(away_games) > 0 else 0
+        
         features.append(home_games_played / 82.0)
         features.append(away_games_played / 82.0)
         
-        # Playoff positioning motivation
-        home_playoff_spot = game_row.get('home_playoff_position', 8)
-        away_playoff_spot = game_row.get('away_playoff_position', 8)
-        features.append(self._motivation_score(home_playoff_spot, home_games_played))
-        features.append(self._motivation_score(away_playoff_spot, away_games_played))
+        # Get team rolling stats for recent performance
+        home_stats = get_team_rolling_window(home_team, game_date, lookback_games=10)
+        away_stats = get_team_rolling_window(away_team, game_date, lookback_games=10)
         
-        # Recent performance (last 10 games)
-        features.append(game_row.get('home_last_10_wins', 5) / 10.0)
-        features.append(game_row.get('away_last_10_wins', 5) / 10.0)
+        if len(home_stats) >= 5:
+            home_last_5 = home_stats.head(5)['win'].sum() / 5.0
+        else:
+            home_last_5 = 0.5
         
-        # Head-to-head this season
-        features.append(game_row.get('h2h_home_wins', 0) / 4.0)
-        features.append(game_row.get('h2h_away_wins', 0) / 4.0)
+        if len(away_stats) >= 5:
+            away_last_5 = away_stats.head(5)['win'].sum() / 5.0
+        else:
+            away_last_5 = 0.5
         
-        # Season phase (early/mid/late/playoffs)
-        season_phase = self._get_season_phase(home_games_played)
-        phase_onehot = [0.0] * 4
-        phase_onehot[season_phase] = 1.0
-        features.extend(phase_onehot)
-        
-        # Altitude (for specific venues)
-        features.append(game_row.get('altitude_feet', 0) / 5000.0)
-        
-        # Referee crew (if available - use historical foul rate)
-        features.append(game_row.get('referee_foul_rate', 0.22))
+        features.append(home_last_5)
+        features.append(away_last_5)
         
         # Pad to 24
+        features = features[:24]
         while len(features) < 24:
             features.append(0.0)
         
-        return np.array(features[:24], dtype=np.float32)
-    
-    def _motivation_score(self, playoff_position: int, games_played: int) -> float:
-        """
-        Compute motivation factor based on playoff race.
-        High motivation if: fighting for playoff spot, or jockeying for seeding late season.
-        """
-        if games_played < 60:
-            return 0.5  # Early season, moderate motivation
-        
-        # Late season
-        if 7 <= playoff_position <= 10:
-            return 1.0  # Fighting for playoff spot
-        elif 1 <= playoff_position <= 3:
-            return 0.9  # Fighting for home court
-        elif playoff_position > 12:
-            return 0.3  # Tanking incentive
-        else:
-            return 0.6
-    
-    def _get_season_phase(self, games_played: int) -> int:
-        """0: early, 1: mid, 2: late, 3: playoffs"""
-        if games_played < 20:
-            return 0
-        elif games_played < 60:
-            return 1
-        elif games_played <= 82:
-            return 2
-        else:
-            return 3
+        return np.array(features, dtype=np.float32)
     
     def process_game(self, game_row: pd.Series, 
-                    player_stats_db: pd.DataFrame,
-                    coplay_db: Dict) -> Dict:
+                    num_players_per_team: int = 18) -> Dict:
         """
         Complete preprocessing for a single game.
         Returns model-ready inputs.
+        
+        Args:
+            game_row: Row from games table
+            num_players_per_team: Number of roster players to include
+        
+        Returns:
+            Dictionary with inputs, targets, and metadata
         """
-        game_date = pd.to_datetime(game_row['game_date'])
+        game_date = game_row['game_date']
+        home_team = game_row['home_team']
+        away_team = game_row['away_team']
         
-        # Extract lineups
-        home_lineup = [
-            game_row.get(f'home_player_{i}', '<UNKNOWN>') 
-            for i in range(1, 6)
-        ]
-        away_lineup = [
-            game_row.get(f'away_player_{i}', '<UNKNOWN>')
-            for i in range(1, 6)
-        ]
+        # Get rosters (active players around game time)
+        home_roster = self.get_team_roster(home_team, game_date)[:num_players_per_team]
+        away_roster = self.get_team_roster(away_team, game_date)[:num_players_per_team]
         
-        # Convert to IDs
+        # Pad rosters if needed
+        while len(home_roster) < num_players_per_team:
+            home_roster.append(0)
+        while len(away_roster) < num_players_per_team:
+            away_roster.append(0)
+        
+        # Convert to model indices
         home_ids = np.array([
-            self.player_id_map.get(p, 0) for p in home_lineup
+            self.player_id_map.get(pid, 0) for pid in home_roster
         ])
         away_ids = np.array([
-            self.player_id_map.get(p, 0) for p in away_lineup
+            self.player_id_map.get(pid, 0) for pid in away_roster
         ])
         
         # Compute features for each player
         home_features = np.stack([
-            self.compute_player_features(p, game_date, player_stats_db)
-            for p in home_lineup
+            self.compute_player_features(pid, game_date) 
+            for pid in home_roster
         ])
         away_features = np.stack([
-            self.compute_player_features(p, game_date, player_stats_db)
-            for p in away_lineup
+            self.compute_player_features(pid, game_date)
+            for pid in away_roster
         ])
         
         # Temporal histories
         home_temporal = np.stack([
-            self.compute_temporal_history(p, game_date, player_stats_db)
-            for p in home_lineup
+            self.compute_temporal_history(pid, game_date)
+            for pid in home_roster
         ])
         away_temporal = np.stack([
-            self.compute_temporal_history(p, game_date, player_stats_db)
-            for p in away_lineup
+            self.compute_temporal_history(pid, game_date)
+            for pid in away_roster
         ])
         
-        # Edge features
-        home_edges = self.compute_edge_features(home_lineup, coplay_db)
-        away_edges = self.compute_edge_features(away_lineup, coplay_db)
+        # Team-level features
+        home_team_features = self.compute_team_features(home_team, game_date)
+        away_team_features = self.compute_team_features(away_team, game_date)
         
-        # Market and context
-        market_features = self.extract_market_features(game_row)
-        context_features = self.extract_context_features(game_row)
+        # Context features
+        context_features = self.compute_context_features(game_row)
+        
+        # Market features (placeholder - would come from betting sites)
+        market_features = np.zeros(16, dtype=np.float32)
+        
+        # Edge features (co-play stats - simplified for NHL)
+        # In full implementation, would track line combinations
+        home_edges = np.zeros((num_players_per_team, num_players_per_team, 8), 
+                              dtype=np.float32)
+        away_edges = np.zeros((num_players_per_team, num_players_per_team, 8),
+                              dtype=np.float32)
         
         # Targets
-        home_won = float(game_row.get('home_score', 0) > game_row.get('away_score', 0))
-        spread = game_row.get('home_score', 0) - game_row.get('away_score', 0)
-        odds = game_row.get('home_odds_decimal', 2.0)
+        home_score = game_row.get('home_score', 0)
+        away_score = game_row.get('away_score', 0)
+        
+        home_won = 1.0 if home_score > away_score else 0.0
+        spread = home_score - away_score
+        
+        # Placeholder odds (would come from market)
+        odds = 2.0
         
         return {
             'inputs': {
@@ -434,19 +552,111 @@ class SportsDataPreprocessor:
                 'away_temporal_history': away_temporal,
                 'home_edge_features': home_edges,
                 'away_edge_features': away_edges,
-                'market_features': market_features,
+                'home_team_features': home_team_features,
+                'away_team_features': away_team_features,
                 'context_features': context_features,
+                'market_metadata': market_features,
             },
             'targets': {
                 'win': home_won,
                 'spread': spread,
-                'odds': odds
+                'odds': odds,
+                'total_goals': home_score + away_score
             },
             'metadata': {
-                'game_id': game_row.get('game_id', ''),
+                'game_id': game_row['game_id'],
                 'game_date': game_date,
-                'home_team': game_row.get('home_team', ''),
-                'away_team': game_row.get('away_team', '')
+                'home_team': home_team,
+                'away_team': away_team,
+                'home_score': home_score,
+                'away_score': away_score
             }
         }
+    
+    def prepare_training_dataset(self, 
+                                start_date: Optional[str] = None,
+                                end_date: Optional[str] = None,
+                                lookback_games: int = 10) -> List[Dict]:
+        """
+        Prepare complete training dataset using database queries.
+        
+        Returns:
+            List of processed game dictionaries
+        """
+        print("\n" + "="*60)
+        print("PREPARING TRAINING DATASET")
+        print("="*60)
+        
+        # Get training data using existing query function
+        df = get_training_data(start_date, end_date, lookback_games)
+        
+        print(f"✓ Loaded {len(df)} games from database")
+        print(f"  Date range: {df['game_date'].min()} to {df['game_date'].max()}")
+        
+        # Process each game
+        processed_games = []
+        
+        for idx, row in df.iterrows():
+            try:
+                processed = self.process_game(row)
+                processed_games.append(processed)
+                
+                if (idx + 1) % 100 == 0:
+                    print(f"  Processed {idx + 1}/{len(df)} games...")
+            
+            except Exception as e:
+                print(f"  ✗ Error processing game {row['game_id']}: {e}")
+                continue
+        
+        print(f"✓ Successfully processed {len(processed_games)} games")
+        print("="*60 + "\n")
+        
+        return processed_games
 
+
+# ============================================================================
+# 2. EXAMPLE USAGE
+# ============================================================================
+
+def test_preprocessor():
+    """Test the preprocessor with real database"""
+    
+    preprocessor = NHLDataPreprocessor()
+    
+    # Build vocabulary
+    preprocessor.fit_player_vocab(min_games=5)
+    
+    # Get a sample game
+    preprocessor.connect()
+    query = """
+    SELECT * FROM games 
+    WHERE game_state IN ('OFF', 'FINAL') 
+    AND game_type = 2
+    AND home_score IS NOT NULL
+    LIMIT 1
+    """
+    
+    sample_game = pd.read_sql_query(query, preprocessor.conn).iloc[0]
+    
+    print("\nProcessing sample game:")
+    print(f"  {sample_game['away_team']} @ {sample_game['home_team']}")
+    print(f"  Date: {sample_game['game_date']}")
+    print(f"  Score: {sample_game['away_score']} - {sample_game['home_score']}")
+    
+    # Process it
+    processed = preprocessor.process_game(sample_game)
+    
+    print("\nProcessed features:")
+    print(f"  Home players: {processed['inputs']['home_player_ids'].shape}")
+    print(f"  Home features: {processed['inputs']['home_features'].shape}")
+    print(f"  Home temporal: {processed['inputs']['home_temporal_history'].shape}")
+    print(f"  Context features: {processed['inputs']['context_features'].shape}")
+    print(f"  Target: Home win = {processed['targets']['win']}")
+    
+    preprocessor.close()
+    
+    print("\n✓ Preprocessor test complete!")
+
+
+if __name__ == "__main__":
+    test_preprocessor()
