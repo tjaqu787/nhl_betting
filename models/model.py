@@ -11,7 +11,8 @@ from typing import Dict, List, Tuple, Optional
 import tensorflow_probability as tfp
 
 tfd = tfp.distributions
-
+from utils.training import create_training_step
+from utils.backtesting import BettingBacktester
 
 # ============================================================================
 # 1. PLAYER EMBEDDING WITH TEMPORAL DYNAMICS
@@ -580,7 +581,7 @@ class DoublMLPlayerEffects(layers.Layer):
 # 9. MAIN MODEL: PUTTING IT ALL TOGETHER
 # ============================================================================
 
-class EliteSportsBettingModel(keras.Model):
+class SportsBettingModel(keras.Model):
     """
     Complete architecture with all 200 IQ enhancements.
     """
@@ -1045,7 +1046,7 @@ def build_model_and_train():
     LEARNING_RATE = 3e-4
     
     # Build model
-    model = EliteSportsBettingModel(
+    model = SportsBettingModel(
         num_players=NUM_PLAYERS,
         embed_dim=EMBED_DIM,
         temporal_dim=TEMPORAL_DIM,
@@ -1073,7 +1074,7 @@ def build_model_and_train():
         lambda_kelly=0.1,
         lambda_calibration=0.2
     )
-    
+
     # Create training step
     train_step_fn = create_training_step(model, optimizer, loss_fn)
     
@@ -1089,40 +1090,6 @@ def build_model_and_train():
     
     return model, optimizer, loss_fn, train_step_fn, backtester
 
-
-# ============================================================================
-# 15. DATA PIPELINE EXAMPLE
-# ============================================================================
-
-def create_mock_data_generator(num_samples=1000, batch_size=32):
-    """
-    Mock data generator for testing.
-    Replace with real data pipeline.
-    """
-    def generator():
-        for _ in range(num_samples // batch_size):
-            batch = {
-                'home_player_ids': np.random.randint(0, 500, (batch_size, 5)),
-                'away_player_ids': np.random.randint(0, 500, (batch_size, 5)),
-                'home_features': np.random.randn(batch_size, 5, 32),
-                'away_features': np.random.randn(batch_size, 5, 32),
-                'home_temporal_history': np.random.randn(batch_size, 5, 10, 32),
-                'away_temporal_history': np.random.randn(batch_size, 5, 10, 32),
-                'home_edge_features': np.random.randn(batch_size, 5, 5, 8),
-                'away_edge_features': np.random.randn(batch_size, 5, 5, 8),
-                'market_features': np.random.randn(batch_size, 16),
-                'context_features': np.random.randn(batch_size, 24),
-            }
-            
-            targets = {
-                'win': np.random.randint(0, 2, (batch_size, 1)).astype(np.float32),
-                'spread': np.random.randn(batch_size, 1).astype(np.float32) * 10,
-                'odds': np.random.uniform(1.5, 3.0, (batch_size, 1)).astype(np.float32)
-            }
-            
-            yield batch, targets
-    
-    return generator
 
 
 # ============================================================================
