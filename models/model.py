@@ -308,39 +308,61 @@ class AttentionPooling(layers.Layer):
 
 
 # ============================================================================
-# 5. MARKET SIGNAL FUSION (200 IQ Enhancement #2)
+# 5. MARKET DISAGREEMENT ANALYZER (200 IQ Enhancement #2 - CORRECTED)
 # ============================================================================
 
-class MarketSignalEncoder(layers.Layer):
+class MarketDisagreementAnalyzer(layers.Layer):
     """
-    Encodes bookmaker lines as informative signals.
-    The market often knows things your model doesn't.
+    CRITICAL FIX: Don't use bookmaker lines as inputs!
+    Instead, analyze market STRUCTURE to detect inefficiencies:
+    - Line movement patterns (sharp vs public money)
+    - Cross-book disagreement (arbitrage opportunities)
+    - Historical market errors on similar games
+    
+    The model makes predictions INDEPENDENTLY, then we compare to market.
     """
     def __init__(self, embed_dim: int, dropout: float = 0.1, **kwargs):
         super().__init__(**kwargs)
-        self.encoder = keras.Sequential([
+        
+        # Encode market METADATA (not the actual lines!)
+        self.metadata_encoder = keras.Sequential([
             layers.Dense(embed_dim, activation='gelu'),
             layers.LayerNormalization(),
             layers.Dropout(dropout),
-            layers.Dense(embed_dim),
-            layers.LayerNormalization()
-        ], name='market_encoder')
+            layers.Dense(embed_dim // 2)
+        ], name='market_metadata_encoder')
         
-        # Gating mechanism to control market influence
-        self.gate = keras.Sequential([
-            layers.Dense(embed_dim, activation='sigmoid')
-        ], name='market_gate')
-    
-    def call(self, market_features, training=False):
+    def call(self, market_metadata, training=False):
         """
         Args:
-            market_features: [batch, market_dim] - spread, total, moneyline, movement
+            market_metadata: [batch, metadata_dim] - NOT actual spreads/odds!
+            Contains only:
+              - Line movement velocity (how fast line moved)
+              - Cross-book disagreement (variance across books)
+              - Public betting % (is this sharp or square money?)
+              - Time until game (urgency)
+              - Historical market accuracy on similar games
+              - Sharp money indicators (reverse line movement)
         Returns:
-            [batch, embed_dim], [batch, embed_dim] (encoded, gate)
+            [batch, embed_dim // 2] - market structure features
         """
-        encoded = self.encoder(market_features, training=training)
-        gate = self.gate(market_features, training=training)
-        return encoded, gate
+        encoded = self.metadata_encoder(market_metadata, training=training)
+        return encoded
+    
+    def compute_edge(self, model_prediction, market_line):
+        """
+        Compare model prediction to market AFTER prediction is made.
+        This happens outside the model, during bet decision.
+        
+        Args:
+            model_prediction: Your independent model's win probability
+            market_line: Bookmaker's implied probability (from odds)
+        Returns:
+            edge: How much you disagree (positive = bet opportunity)
+        """
+        # Simple edge calculation
+        edge = model_prediction - market_line
+        return edge
 
 
 # ============================================================================
@@ -558,7 +580,7 @@ class DoublMLPlayerEffects(layers.Layer):
 # 9. MAIN MODEL: PUTTING IT ALL TOGETHER
 # ============================================================================
 
-class SportsBettingModel(keras.Model):
+class EliteSportsBettingModel(keras.Model):
     """
     Complete architecture with all 200 IQ enhancements.
     """
@@ -600,8 +622,8 @@ class SportsBettingModel(keras.Model):
         self.pool_home = AttentionPooling(embed_dim)
         self.pool_away = AttentionPooling(embed_dim)
         
-        # Component 5: Market signal encoder (200 IQ #2)
-        self.market_encoder = MarketSignalEncoder(embed_dim, dropout)
+        # Component 5: Market metadata analyzer (200 IQ #2 - CORRECTED)
+        self.market_analyzer = MarketDisagreementAnalyzer(embed_dim, dropout)
         
         # Component 6: Game state transformer (200 IQ #1)
         self.game_state_model = GameStateTransformer(
@@ -704,17 +726,17 @@ class SportsBettingModel(keras.Model):
         home_team = self.pool_home(home_players, training=training)
         away_team = self.pool_away(away_players, training=training)
         
-        # Encode market signals (200 IQ #2)
-        market_signal, market_gate = self.market_encoder(
-            inputs['market_features'], training=training
+        # Encode market metadata (NOT actual lines!)
+        market_metadata = self.market_analyzer(
+            inputs['market_metadata'], training=training
         )
         
-        # Combine all signals
+        # Combine all signals (market metadata only provides context about market structure)
         combined = tf.concat([
             home_team, 
             away_team, 
             inputs['context_features'],
-            market_signal * market_gate  # Gated market influence
+            market_metadata  # Only structural info, not anchoring lines
         ], axis=-1)
         
         fused = self.context_fusion(combined, training=training)
@@ -929,7 +951,6 @@ class CompositeLoss(keras.losses.Loss):
 
 
 
-
 # ============================================================================
 # 13. COUNTERFACTUAL LINEUP ANALYZER
 # ============================================================================
@@ -1024,7 +1045,7 @@ def build_model_and_train():
     LEARNING_RATE = 3e-4
     
     # Build model
-    model = SportsBettingModel(
+    model = EliteSportsBettingModel(
         num_players=NUM_PLAYERS,
         embed_dim=EMBED_DIM,
         temporal_dim=TEMPORAL_DIM,
@@ -1069,6 +1090,39 @@ def build_model_and_train():
     return model, optimizer, loss_fn, train_step_fn, backtester
 
 
+# ============================================================================
+# 15. DATA PIPELINE EXAMPLE
+# ============================================================================
+
+def create_mock_data_generator(num_samples=1000, batch_size=32):
+    """
+    Mock data generator for testing.
+    Replace with real data pipeline.
+    """
+    def generator():
+        for _ in range(num_samples // batch_size):
+            batch = {
+                'home_player_ids': np.random.randint(0, 500, (batch_size, 5)),
+                'away_player_ids': np.random.randint(0, 500, (batch_size, 5)),
+                'home_features': np.random.randn(batch_size, 5, 32),
+                'away_features': np.random.randn(batch_size, 5, 32),
+                'home_temporal_history': np.random.randn(batch_size, 5, 10, 32),
+                'away_temporal_history': np.random.randn(batch_size, 5, 10, 32),
+                'home_edge_features': np.random.randn(batch_size, 5, 5, 8),
+                'away_edge_features': np.random.randn(batch_size, 5, 5, 8),
+                'market_features': np.random.randn(batch_size, 16),
+                'context_features': np.random.randn(batch_size, 24),
+            }
+            
+            targets = {
+                'win': np.random.randint(0, 2, (batch_size, 1)).astype(np.float32),
+                'spread': np.random.randn(batch_size, 1).astype(np.float32) * 10,
+                'odds': np.random.uniform(1.5, 3.0, (batch_size, 1)).astype(np.float32)
+            }
+            
+            yield batch, targets
+    
+    return generator
 
 
 # ============================================================================
@@ -1076,24 +1130,5 @@ def build_model_and_train():
 # ============================================================================
 
 if __name__ == "__main__":
-    print("=" * 80)
-    print("SPORTS BETTING MODEL")
-    print("=" * 80)
-    
     # Build model
     model, optimizer, loss_fn, train_step_fn, backtester = build_model_and_train()
-    
-    print("\nModel architecture summary:")
-    print(f"  - Player embeddings: learned & temporal")
-    print(f"  - Lineup modeling: Graph Attention Networks")
-    print(f"  - Matchup modeling: Cross-Attention Transformer")
-    print(f"  - Uncertainty: Mixture Density Networks")
-    print(f"  - Loss: Multi-task (Win + Spread + Kelly + Calibration)")
-    
-    print("\n" + "=" * 80)
-    print("Ready for training! Next steps:")
-    print("  1. Replace mock data with real lineup/box score data")
-    print("  2. Run walk-forward validation")
-    print("  3. Backtest with BettingBacktester")
-    print("  4. Deploy with live odds feed integration")
-    print("=" * 80)
