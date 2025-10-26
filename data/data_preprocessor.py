@@ -30,7 +30,7 @@ from data.queries import (
 # 1. NHL DATA PREPROCESSOR
 # ============================================================================
 
-class NHLDataPreprocessor:
+class SportsDataPreprocessor:
     """
     Converts raw NHL game data into model-ready features.
     Handles: player stats, lineups, temporal sequences, team features.
@@ -621,7 +621,7 @@ class NHLDataPreprocessor:
 def test_preprocessor():
     """Test the preprocessor with real database"""
     
-    preprocessor = NHLDataPreprocessor()
+    preprocessor = SportsDataPreprocessor()
     
     # Build vocabulary
     preprocessor.fit_player_vocab(min_games=5)

@@ -1086,7 +1086,6 @@ def build_model_and_train():
     )
     
     print("Model built successfully!")
-    print(f"Total parameters: {model.count_params():,}")
     
     return model, optimizer, loss_fn, train_step_fn, backtester
 
