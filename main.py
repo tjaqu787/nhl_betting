@@ -79,14 +79,13 @@ def run_training():
         print("Starting walk-forward training...")
         print("(Set epochs_per_window=1 for quick debug)\n")
         
-        # Uncomment to actually train:
-        # orchestrator.train_walk_forward(
-        #     preprocessor=preprocessor,
-        #     game_logs=game_logs,
-        #     train_window_months=6,
-        #     val_window_months=1,
-        #     epochs_per_window=1  # Set to 1 for quick debug
-        # )
+        orchestrator.train_walk_forward(
+            preprocessor=preprocessor,
+            game_logs=game_logs,
+            train_window_months=6,
+            val_window_months=1,
+            epochs_per_window=1  # Set to 1 for quick debug
+        )
         
         print("✓ Training complete (currently stubbed)")
         print("\n" + "="*80)
