@@ -30,7 +30,7 @@ def run_training():
     print("="*80 + "\n")
     
     try:
-        from data.data_preprocessor import SportsDataPreprocessor
+        from data.data_preprocessor import DataPreprocessor
         from utils.training import TrainingOrchestrator
         from models.model import build_model_and_train
         import pandas as pd
@@ -43,7 +43,7 @@ def run_training():
         print("✓ Model built")
         
         # Initialize preprocessor
-        preprocessor = SportsDataPreprocessor()
+        preprocessor = DataPreprocessor()
         print("✓ Preprocessor initialized")
         
         # Initialize training orchestrator
