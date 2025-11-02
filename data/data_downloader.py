@@ -542,6 +542,65 @@ class NHLDataScraper:
         """
         return self.fetch_play_by_play(game_id)
     
+    def fetch_game_officials(self, game_id: int) -> bool:
+        """
+        Fetch referee and official data from right-rail endpoint.
+        Returns True if successful, False otherwise.
+        """
+        endpoint = f"/gamecenter/{game_id}/right-rail"
+        data = self._get(endpoint)
+        
+        if not data:
+            return False
+        
+        # Extract referee information from gameInfo
+        game_info = data.get('gameInfo', {})
+        
+        if not game_info:
+            return False
+        
+        referees = game_info.get('referees', [])
+        linesmen = game_info.get('linesmen', [])
+        
+        # If no officials data, return False
+        if not referees and not linesmen:
+            return False
+        
+        cursor = self.conn.cursor()
+        
+        # Store each referee
+        for idx, ref_obj in enumerate(referees):
+            ref_name = ref_obj.get('default', '')
+            if ref_name:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO game_officials 
+                    VALUES (NULL, ?, ?, 'REFEREE', ?, ?, ?)
+                """, (
+                    game_id,
+                    ref_name,
+                    idx + 1,  # referee number (1 or 2)
+                    json.dumps(game_info),
+                    datetime.now()
+                ))
+        
+        # Store each linesman
+        for idx, lines_obj in enumerate(linesmen):
+            lines_name = lines_obj.get('default', '')
+            if lines_name:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO game_officials 
+                    VALUES (NULL, ?, ?, 'LINESMAN', ?, ?, ?)
+                """, (
+                    game_id,
+                    lines_name,
+                    idx + 1,  # linesman number (1 or 2)
+                    json.dumps(game_info),
+                    datetime.now()
+                ))
+        
+        self.conn.commit()
+        return len(referees) > 0 or len(linesmen) > 0
+    
     def fetch_recent_games_stats(self, days: int = 7) -> int:
         """Fetch boxscores for recent completed games"""
         print(f"\nFetching game stats for last {days} days...")
