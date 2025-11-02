@@ -613,6 +613,153 @@ class DataPreprocessor:
         
         return processed_games
 
+# ============================================================================
+# REFEREE DATA PREPROCESSING FUNCTIONS
+# ============================================================================
+
+def compute_ref_team_history(home_team: str, away_team: str, 
+                             ref_names: List[str], game_date: str,
+                             db_path: str = "nhl_data.db",
+                             lookback_games: int = 50) -> np.ndarray:
+    """
+    Compute historical team-ref interaction stats.
+    
+    Returns: [6] features:
+        - home_win_rate_with_refs
+        - away_win_rate_with_refs
+        - home_pim_rate_with_refs
+        - away_pim_rate_with_refs
+        - ref_home_bias_general
+        - games_with_these_refs_together
+    """
+    import pandas as pd
+    
+    conn = sqlite3.connect(db_path)
+    
+    features = []
+    
+    # Home team with these refs
+    home_query = """
+    SELECT AVG(CASE WHEN g.home_team = ? AND g.home_score > g.away_score THEN 1
+                    WHEN g.away_team = ? AND g.away_score > g.home_score THEN 1
+                    ELSE 0 END) as win_rate,
+           AVG(tgs.pim) as avg_pim
+    FROM games g
+    JOIN game_officials go ON g.game_id = go.game_id
+    JOIN team_game_stats tgs ON g.game_id = tgs.game_id 
+        AND (tgs.team_abbrev = ? OR tgs.team_abbrev = ?)
+    WHERE go.official_name IN ({})
+    AND g.game_date < ?
+    AND g.game_date > date(?, '-{} days')
+    """.format(','.join(['?']*len(ref_names)), lookback_games * 2)
+    
+    home_stats = pd.read_sql_query(home_query, conn, 
+        params=[home_team, home_team, home_team, home_team] + 
+               ref_names + [game_date, game_date])
+    
+    # Away team with these refs
+    away_query = home_query  # Same query structure for away team
+    away_stats = pd.read_sql_query(away_query, conn, 
+        params=[away_team, away_team, away_team, away_team] + 
+               ref_names + [game_date, game_date])
+    
+    # Ref general home bias
+    bias_query = """
+    SELECT 
+        AVG(CASE WHEN g.home_score > g.away_score THEN 1 ELSE 0 END) - 0.55 as home_bias
+    FROM games g
+    JOIN game_officials go ON g.game_id = go.game_id
+    WHERE go.official_name IN ({})
+    AND g.game_date < ?
+    """.format(','.join(['?']*len(ref_names)))
+    
+    ref_bias = pd.read_sql_query(bias_query, conn, 
+        params=ref_names + [game_date])
+    
+    features.append(home_stats['win_rate'].iloc[0] if len(home_stats) > 0 else 0.5)
+    features.append(away_stats['win_rate'].iloc[0] if len(away_stats) > 0 else 0.5)
+    features.append(home_stats['avg_pim'].iloc[0] if len(home_stats) > 0 else 8.0)
+    features.append(away_stats['avg_pim'].iloc[0] if len(away_stats) > 0 else 8.0)
+    features.append(ref_bias['home_bias'].iloc[0] if len(ref_bias) > 0 else 0.0)
+    features.append(float(len(home_stats)))  # Sample size indicator
+    
+    conn.close()
+    return np.array(features, dtype=np.float32)
+
+
+def compute_player_ref_style(player_id: int, game_date: str,
+                             db_path: str = "nhl_data.db", 
+                             lookback_games: int = 20) -> np.ndarray:
+    """
+    Compute player style features relevant to ref interactions.
+    
+    Returns: [8] features:
+        - physicality (hits + blocked per game)
+        - pim_rate (penalties per game)
+        - pp_usage (% of PP time)
+        - pk_usage (% of PK time)
+        - finesse_score (points per physical play)
+        - defensive_focus (def zone starts %)
+        - agitator_score (pim + hits normalized)
+        - discipline (pim variance)
+    """
+    import pandas as pd
+    
+    conn = sqlite3.connect(db_path)
+    
+    # Get recent player games
+    query = """
+    SELECT hits, blocked, pim, powerplay_goals, powerplay_assists,
+           shorthanded_goals, shorthanded_assists, points, shots
+    FROM player_game_stats
+    WHERE player_id = ? AND game_date < ?
+    ORDER BY game_date DESC
+    LIMIT ?
+    """
+    
+    player_games = pd.read_sql_query(query, conn, 
+        params=[player_id, game_date, lookback_games])
+    
+    conn.close()
+    
+    if len(player_games) == 0:
+        return np.zeros(8, dtype=np.float32)
+    
+    features = []
+    
+    # Physicality
+    features.append(player_games['hits'].mean() + player_games['blocked'].mean())
+    
+    # PIM rate
+    features.append(player_games['pim'].mean())
+    
+    # PP usage (from pp_goals/assists)
+    pp_rate = (player_games['powerplay_goals'] + player_games['powerplay_assists']).sum()
+    features.append(pp_rate / max(len(player_games), 1))
+    
+    # PK usage (estimated from shorthanded stats)
+    pk_rate = (player_games['shorthanded_goals'] + player_games['shorthanded_assists']).sum()
+    features.append(pk_rate / max(len(player_games), 1))
+    
+    # Finesse score (offensive skill vs physical play)
+    total_physical = player_games['hits'].sum() + player_games['blocked'].sum()
+    finesse = player_games['points'].sum() / max(total_physical, 1)
+    features.append(finesse)
+    
+    # Defensive focus (proxy: blocked shots / total shots)
+    def_focus = player_games['blocked'].sum() / max(player_games['shots'].sum(), 1)
+    features.append(def_focus)
+    
+    # Agitator score (normalized)
+    agitator = (player_games['pim'].mean() + player_games['hits'].mean() * 0.1)
+    features.append(min(agitator / 5.0, 1.0))
+    
+    # Discipline (consistency in penalty taking)
+    features.append(player_games['pim'].std())
+    
+    return np.array(features, dtype=np.float32)
+
+
 
 # ============================================================================
 # 2. EXAMPLE USAGE

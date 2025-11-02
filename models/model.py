@@ -238,6 +238,74 @@ class GoalieEmbeddingLayer(layers.Layer):
 # PATH 1: GNN PROCESSING
 # ============================================================================
 
+class RefPlayerModulator(layers.Layer):
+    """
+    Modulates individual player embeddings based on referee tendencies.
+    
+    Example: Physical defenseman with strict ref → reduced effectiveness
+    Example: Sniper with ref who calls lots of penalties → more PP opportunities
+    """
+    def __init__(self, num_refs: int, embed_dim: int, dropout: float = 0.1, **kwargs):
+        super().__init__(**kwargs)
+        
+        # Ref tendency vectors (what playstyle does this ref penalize/favor?)
+        self.ref_tendencies = layers.Embedding(
+            num_refs,
+            embed_dim,
+            embeddings_regularizer=keras.regularizers.l2(1e-5),
+            name='ref_tendencies'
+        )
+        
+        # Player-ref compatibility network
+        # "How compatible is this player's style with this ref's tendencies?"
+        self.compatibility_net = keras.Sequential([
+            layers.Dense(64, activation='gelu'),
+            layers.Dropout(dropout),
+            layers.Dense(32, activation='gelu'),
+            layers.Dense(1, activation='tanh')  # -1 (bad matchup) to +1 (good matchup)
+        ], name='player_ref_compatibility')
+        
+        # Modulation network (how much to adjust player embedding)
+        self.modulation_net = keras.Sequential([
+            layers.Dense(embed_dim, activation='gelu'),
+            layers.Dropout(dropout),
+            layers.Dense(embed_dim)
+        ], name='ref_modulation')
+    
+    def call(self, player_embeddings, ref_ids, player_styles=None, training=False):
+        """
+        Args:
+            player_embeddings: [batch, num_players, embed_dim]
+            ref_ids: [batch, num_refs] typically 2 refs
+            player_styles: [batch, num_players, style_dim] optional
+                e.g., [physicality, finesse, defensive_focus, pp_specialist, ...]
+        
+        Returns:
+            modulated_embeddings: [batch, num_players, embed_dim]
+            compatibility_scores: [batch, num_players, 1]
+        """
+        batch_size = tf.shape(player_embeddings)[0]
+        num_players = tf.shape(player_embeddings)[1]
+        
+        # Get ref tendency vectors (average if multiple refs)
+        ref_embeds = self.ref_tendencies(ref_ids)  # [B, num_refs, E]
+        ref_tendency = tf.reduce_mean(ref_embeds, axis=1, keepdims=True)  # [B, 1, E]
+        ref_tendency = tf.tile(ref_tendency, [1, num_players, 1])  # [B, num_players, E]
+        
+        # Compute player-ref compatibility
+        combined = tf.concat([player_embeddings, ref_tendency], axis=-1)
+        compatibility = self.compatibility_net(combined, training=training)  # [B, P, 1]
+        
+        # Generate modulation (how to adjust each player's embedding)
+        modulation = self.modulation_net(combined, training=training)  # [B, P, E]
+        
+        # Apply modulation (scaled by compatibility)
+        # Positive compatibility = boost, negative = nerf
+        modulated_embeddings = player_embeddings + (compatibility * modulation * 0.1)
+        
+        return modulated_embeddings, compatibility
+
+
 class GNNPath(keras.Model):
     """
     GNN path: Models team as a network.
@@ -245,7 +313,7 @@ class GNNPath(keras.Model):
     
     Good for: Team-level play style, network effects, structural advantages
     """
-    def __init__(self, embed_dim: int, num_gnn_layers: int = 3,
+    def __init__(self, embed_dim: int, num_refs: int, num_gnn_layers: int = 3,
                  num_heads: int = 4, dropout: float = 0.1, **kwargs):
         super().__init__(**kwargs)
         
@@ -282,19 +350,32 @@ class GNNPath(keras.Model):
             layers.LayerNormalization(),
             layers.Dropout(dropout)
         ], name='graph_pooling')
+        
+        # NEW: Ref modulator
+        self.ref_modulator = RefPlayerModulator(num_refs, embed_dim, dropout)
     
-    def call(self, player_embeddings, edge_features=None, 
+    def call(self, player_embeddings, ref_ids=None, edge_features=None, 
              attention_mask=None, training=False):
         """
         Args:
             player_embeddings: [batch, num_players, embed_dim]
+            ref_ids: [batch, num_refs] NEW
             edge_features: [batch, num_players, num_players, edge_dim]
             attention_mask: [batch, num_players, num_players]
         
         Returns:
             team_embedding: [batch, embed_dim]
+            player_embeddings: [batch, num_players, embed_dim]
+            ref_compatibility: [batch, num_players, 1] or None
         """
-        x = player_embeddings
+        # NEW: Apply ref modulation BEFORE message passing
+        if ref_ids is not None:
+            x, ref_compatibility = self.ref_modulator(
+                player_embeddings, ref_ids, training=training
+            )
+        else:
+            x = player_embeddings
+            ref_compatibility = None
         
         # Message passing through GNN layers
         for layer in self.gnn_layers:
@@ -315,7 +396,7 @@ class GNNPath(keras.Model):
         team_embedding = tf.reduce_mean(x, axis=1)  # Simple mean pooling
         team_embedding = self.graph_pool(team_embedding, training=training)
         
-        return team_embedding, x  # Return both team and player-level outputs
+        return team_embedding, x, ref_compatibility  # Return compatibility for analysis
 
 
 # ============================================================================
@@ -332,7 +413,7 @@ class BayesianPath(keras.Model):
     
     Good for: Small sample matchups, tactical advantages, line chemistry
     """
-    def __init__(self, embed_dim: int, num_archetypes: int = 10,
+    def __init__(self, embed_dim: int, num_refs: int, num_archetypes: int = 10,
                  dropout: float = 0.1, **kwargs):
         super().__init__(**kwargs)
         
@@ -375,20 +456,43 @@ class BayesianPath(keras.Model):
             layers.Dropout(dropout),
             layers.Dense(embed_dim)
         ], name='matchup_encoder')
+
+        self.ref_embeddings = layers.Embedding(
+            num_refs,
+            embed_dim // 4,  # Smaller than team embeddings
+            embeddings_regularizer=keras.regularizers.l2(1e-5),
+            name='ref_matchup_embeddings'
+        )
+        
+        self.team_ref_interaction = keras.Sequential([
+            layers.Dense(embed_dim, activation='gelu'),
+            layers.LayerNormalization(),
+            layers.Dropout(dropout)
+        ], name='team_ref_interaction')
+        
+        # "How does Home Team + Away Team + Ref combo historically perform?"
+        self.bias_estimator = keras.Sequential([
+            layers.Dense(64, activation='gelu'),
+            layers.Dropout(dropout),
+            layers.Dense(32, activation='gelu'),
+            layers.Dense(1, activation='tanh')  # -1 to +1 bias
+        ], name='ref_bias_estimator')
+    
     
     def call(self, home_player_embeddings, away_player_embeddings,
-             home_line_indices=None, away_line_indices=None,
-             training=False, return_uncertainty=True):
+                ref_ids=None, ref_team_history=None, 
+                home_line_indices=None, away_line_indices=None,
+                training=False, return_uncertainty=True):
         """
         Args:
-            home_player_embeddings: [batch, num_players, embed_dim]
-            away_player_embeddings: [batch, num_players, embed_dim]
-            home_line_indices: [batch, line_size] - indices of starting line
-            away_line_indices: [batch, line_size] - indices of starting line
-        
-        Returns:
-            matchup_embedding: [batch, embed_dim]
-            uncertainty: [batch, 1] (if return_uncertainty=True)
+            ref_ids: [batch, num_refs] typically 2 refs
+            ref_team_history: [batch, 6] features like:
+                - home_team_win_rate_with_these_refs
+                - away_team_win_rate_with_these_refs
+                - home_team_pim_rate_with_these_refs
+                - away_team_pim_rate_with_these_refs
+                - ref_home_bias_general
+                - games_officiated_together
         """
         # Aggregate to line level (either specific line or full team)
         if home_line_indices is not None:
@@ -407,9 +511,38 @@ class BayesianPath(keras.Model):
         else:
             away_line = tf.reduce_mean(away_player_embeddings, axis=1)
             away_line = self.line_aggregator(away_line, training=training)
+        if ref_ids is not None:
+            ref_embeds = self.ref_embeddings(ref_ids)  # [B, num_refs, E//4]
+            ref_context = tf.reduce_mean(ref_embeds, axis=1)  # [B, E//4]
+            
+            # Combine team embeddings with ref
+            home_ref_interaction = self.team_ref_interaction(
+                tf.concat([home_line, ref_context], axis=-1),
+                training=training
+            )
+            away_ref_interaction = self.team_ref_interaction(
+                tf.concat([away_line, ref_context], axis=-1),
+                training=training
+            )
+            
+            # Estimate historical bias
+            if ref_team_history is not None:
+                ref_bias = self.bias_estimator(ref_team_history, training=training)
+            else:
+                ref_bias = tf.zeros((tf.shape(home_line)[0], 1))
+        else:
+            home_ref_interaction = home_line
+            away_ref_interaction = away_line
+            ref_bias = tf.zeros((tf.shape(home_line)[0], 1))
+        
+        # Use ref-adjusted line embeddings for matchup context
+        matchup_context = tf.concat([
+            home_ref_interaction, 
+            away_ref_interaction,
+            ref_bias
+        ], axis=-1)
         
         # Determine which league archetype this matchup resembles
-        matchup_context = tf.concat([home_line, away_line], axis=-1)
         archetype_probs = self.archetype_classifier(matchup_context, training=training)
         
         # Get archetype prior (weighted average of archetypes)
@@ -442,7 +575,7 @@ class BayesianPath(keras.Model):
         
         if return_uncertainty:
             uncertainty = tf.reduce_mean(sigma, axis=-1, keepdims=True)
-            return matchup_embedding, uncertainty, archetype_probs
+            return matchup_embedding, uncertainty, archetype_probs, ref_bias
         else:
             return matchup_embedding
 
@@ -519,6 +652,7 @@ class NHLDualPathModel(keras.Model):
     def __init__(self, 
                  num_skaters: int,
                  num_goalies: int,
+                 num_refs: int,  # NEW
                  embed_dim: int = 128,
                  temporal_dim: int = 64,
                  num_gnn_layers: int = 3,
@@ -530,19 +664,23 @@ class NHLDualPathModel(keras.Model):
         self.embed_dim = embed_dim
         
         # Separate embeddings for skaters and goalies
-        self.skater_embedder = PlayerEmbeddingLayer(
+        self.skater_embedder = SkaterEmbeddingLayer(
             num_skaters, embed_dim, temporal_dim, dropout
         )
         
-        self.goalie_embedder = PlayerEmbeddingLayer(
+        self.goalie_embedder = GoalieEmbeddingLayer(
             num_goalies, embed_dim, temporal_dim, dropout
         )
         
-        # Path 1: GNN
-        self.gnn_path = GNNPath(embed_dim, num_gnn_layers, num_heads=4, dropout=dropout)
+        # Path 1: GNN (with ref player modulation)
+        self.gnn_path = GNNPath(
+            embed_dim, num_refs, num_gnn_layers, num_heads=4, dropout=dropout
+        )
         
-        # Path 2: Bayesian
-        self.bayes_path = BayesianPath(embed_dim, num_archetypes=10, dropout=dropout)
+        # Path 2: Bayesian (with ref matchup context)
+        self.bayes_path = BayesianPath(
+            embed_dim, num_refs, num_archetypes=10, dropout=dropout
+        )
         
         # Context encoder (game situation, rest, etc.)
         self.context_encoder = keras.Sequential([
@@ -593,6 +731,10 @@ class NHLDualPathModel(keras.Model):
                 
                 # Context
                 - context_features: [batch, context_dim]
+                
+                # NEW: Referee features
+                - ref_ids: [batch, num_refs]
+                - ref_team_history: [batch, 6]
         
         Returns:
             dict with predictions from all heads + intermediates
@@ -637,26 +779,30 @@ class NHLDualPathModel(keras.Model):
         home_players = tf.concat([home_skater_embeds, home_goalie_embed], axis=1)  # [B, 6, E]
         away_players = tf.concat([away_skater_embeds, away_goalie_embed], axis=1)
         
-        # STEP 2: Process through GNN path
-        home_gnn, home_player_gnn = self.gnn_path(
+        # STEP 2: GNN path WITH ref modulation
+        home_gnn, home_player_gnn, home_ref_compat = self.gnn_path(
             home_players,
-            inputs.get('home_edge_features'),
-            training=training
-        )  # [B, E], [B, 6, E]
-        
-        away_gnn, away_player_gnn = self.gnn_path(
-            away_players,
-            inputs.get('away_edge_features'),
+            ref_ids=inputs.get('ref_ids'),  # NEW
+            edge_features=inputs.get('home_edge_features'),
             training=training
         )
         
-        # STEP 3: Process through Bayesian path
-        bayes_matchup, bayes_uncertainty, archetype_probs = self.bayes_path(
+        away_gnn, away_player_gnn, away_ref_compat = self.gnn_path(
+            away_players,
+            ref_ids=inputs.get('ref_ids'),  # NEW
+            edge_features=inputs.get('away_edge_features'),
+            training=training
+        )
+        
+        # STEP 3: Bayesian path WITH ref matchup context
+        bayes_matchup, bayes_uncertainty, archetype_probs, ref_bias = self.bayes_path(
             home_players,
             away_players,
+            ref_ids=inputs.get('ref_ids'),  # NEW
+            ref_team_history=inputs.get('ref_team_history'),  # NEW
             training=training,
             return_uncertainty=True
-        )  # [B, E], [B, 1], [B, 10]
+        )
         
         # STEP 4: Encode context
         context = self.context_encoder(inputs['context_features'], training=training)
@@ -682,7 +828,10 @@ class NHLDualPathModel(keras.Model):
             'bayes_uncertainty': bayes_uncertainty,
             'archetype_probs': archetype_probs,
             'home_player_embeddings': home_players,
-            'away_player_embeddings': away_players
+            'away_player_embeddings': away_players,
+            'home_ref_compatibility': home_ref_compat,
+            'away_ref_compatibility': away_ref_compat,
+            'ref_bias': ref_bias,
         })
         
         return predictions
@@ -703,8 +852,8 @@ class NHLDualPathModel(keras.Model):
 # BUILD FUNCTION
 # ============================================================================
 
-def get_player_counts(db_path: str = "nhl_data.db") -> Tuple[int, int]:
-    """Get player counts from database"""
+def get_player_counts(db_path: str = "nhl_data.db") -> Tuple[int, int, int]:
+    """Get player and referee counts from database"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
@@ -718,8 +867,17 @@ def get_player_counts(db_path: str = "nhl_data.db") -> Tuple[int, int]:
     """)
     num_goalies = cursor.fetchone()[0] + 1
     
+    # Add referee count
+    try:
+        cursor.execute("""
+            SELECT COUNT(DISTINCT official_name) FROM game_officials
+        """)
+        num_refs = cursor.fetchone()[0] + 1  # +1 for padding
+    except:
+        num_refs = 100  # Default fallback
+    
     conn.close()
-    return num_skaters, num_goalies
+    return num_skaters, num_goalies, num_refs
 
 
 def build_model_and_train(db_path: str = "nhl_data.db",
@@ -734,14 +892,16 @@ def build_model_and_train(db_path: str = "nhl_data.db",
     print("="*80)
     
     # Get player counts
-    num_skaters, num_goalies = get_player_counts(db_path)
+    num_skaters, num_goalies, num_refs = get_player_counts(db_path)
     print(f"\n✓ Skaters: {num_skaters}")
     print(f"✓ Goalies: {num_goalies}")
+    print(f"✓ Referees: {num_refs}")
     
     # Build model
     model = NHLDualPathModel(
         num_skaters=num_skaters,
         num_goalies=num_goalies,
+        num_refs=num_refs,
         embed_dim=128,
         temporal_dim=64,
         num_gnn_layers=3,
