@@ -652,7 +652,7 @@ class NHLDualPathModel(keras.Model):
     def __init__(self, 
                  num_skaters: int,
                  num_goalies: int,
-                 num_refs: int,  # NEW
+                 num_refs: int,
                  embed_dim: int = 128,
                  temporal_dim: int = 64,
                  num_gnn_layers: int = 3,
@@ -852,27 +852,49 @@ class NHLDualPathModel(keras.Model):
 # BUILD FUNCTION
 # ============================================================================
 
-def get_player_counts(db_path: str = "nhl_data.db") -> Tuple[int, int, int]:
+def get_player_counts(db_path: str = "data/nhl_data.db") -> Tuple[int, int, int]:
     """Get player and referee counts from database"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    cursor.execute("""
-        SELECT COUNT(DISTINCT player_id) FROM player_game_stats WHERE position != 'G'
-    """)
-    num_skaters = cursor.fetchone()[0] + 1  # +1 for padding
+    min_games =10
     
     cursor.execute("""
-        SELECT COUNT(DISTINCT player_id) FROM player_game_stats WHERE position = 'G'
-    """)
-    num_goalies = cursor.fetchone()[0] + 1
+        SELECT COUNT(*) FROM (
+            SELECT player_id
+            FROM player_game_stats
+            WHERE position != 'G'
+            GROUP BY player_id
+            HAVING COUNT(DISTINCT game_id) >= ?
+        )
+    """, (min_games,))
+    result = cursor.fetchone()
+    num_skaters = (result[0]) + 1
+    
+    # Goalies with minimum games
+    cursor.execute("""
+        SELECT COUNT(*) FROM (
+            SELECT player_id
+            FROM player_game_stats
+            WHERE position = 'G'
+            GROUP BY player_id
+            HAVING COUNT(DISTINCT game_id) >= ?
+        )
+    """, (min_games,))
+    result = cursor.fetchone()
+    num_goalies = (result[0]) + 1
     
     # Add referee count
     try:
         cursor.execute("""
-            SELECT COUNT(DISTINCT official_name) FROM game_officials
-        """)
-        num_refs = cursor.fetchone()[0] + 1  # +1 for padding
+            SELECT COUNT(*) FROM (
+                SELECT official_name
+                FROM game_officials
+                GROUP BY official_name
+                HAVING COUNT(DISTINCT game_id) >= ?
+            )
+        """, (min_games,))
+        num_refs = cursor.fetchone()[0] + 1
     except:
         num_refs = 100  # Default fallback
     
@@ -880,7 +902,7 @@ def get_player_counts(db_path: str = "nhl_data.db") -> Tuple[int, int, int]:
     return num_skaters, num_goalies, num_refs
 
 
-def build_model_and_train(db_path: str = "nhl_data.db",
+def build_model_and_train(db_path: str = "data/nhl_data.db",
                           output_heads: List[str] = ['moneyline', 'puck_line', 'total']):
     """
     Build complete NHL dual-path model.

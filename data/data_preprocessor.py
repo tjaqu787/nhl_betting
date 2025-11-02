@@ -35,7 +35,7 @@ class DataPreprocessor:
     Converts raw NHL game data into model-ready features.
     Handles: player stats, lineups, temporal sequences, team features.
     """
-    def __init__(self, db_path: str = "nhl_data.db"):
+    def __init__(self, db_path: str = "data/nhl_data.db"):
         self.db_path = db_path
         self.conn = None
         
@@ -619,7 +619,7 @@ class DataPreprocessor:
 
 def compute_ref_team_history(home_team: str, away_team: str, 
                              ref_names: List[str], game_date: str,
-                             db_path: str = "nhl_data.db",
+                             db_path: str = "data/nhl_data.db",
                              lookback_games: int = 50) -> np.ndarray:
     """
     Compute historical team-ref interaction stats.
@@ -688,7 +688,7 @@ def compute_ref_team_history(home_team: str, away_team: str,
 
 
 def compute_player_ref_style(player_id: int, game_date: str,
-                             db_path: str = "nhl_data.db", 
+                             db_path: str = "data/nhl_data.db", 
                              lookback_games: int = 20) -> np.ndarray:
     """
     Compute player style features relevant to ref interactions.
