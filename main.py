@@ -39,7 +39,7 @@ def run_training():
         print("-" * 40)
         
         # Build model
-        model, optimizer, loss_fn, train_step_fn, backtester = build_model_and_train()
+        model, optimizer, loss_fn = build_model_and_train()
         print("✓ Model built")
         
         # Initialize preprocessor
@@ -51,8 +51,6 @@ def run_training():
             model=model,
             optimizer=optimizer,
             loss_fn=loss_fn,
-            train_step_fn=train_step_fn,
-            backtester=backtester
         )
         print("✓ Training orchestrator ready")
         

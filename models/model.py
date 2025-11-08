@@ -953,40 +953,9 @@ def build_model_and_train(db_path: str = "data/nhl_data.db",
         
         return total_loss
     
-    # Training step
-    @tf.function
-    def train_step(inputs, targets):
-        with tf.GradientTape() as tape:
-            predictions = model(inputs, training=True)
-            loss = loss_fn(targets, predictions)
-        
-        gradients = tape.gradient(loss, model.trainable_variables)
-        gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        
-        return loss, predictions
-    
-    # Backtester
-    backtester = BettingBacktester(
-        initial_bankroll=10000.0,
-        max_kelly_fraction=0.02,
-        min_edge_threshold=0.02
-    )
-    
     print(f"\n✓ Model built with {len(output_heads)} output heads:")
     for head in output_heads:
         print(f"    - {head}")
     
-    print("\nArchitecture:")
-    print("  1. Shared Player Embeddings (skill + style + form)")
-    print("  2. GNN Path (network structure, passing, chemistry)")
-    print("  3. Bayesian Path (line matchups with uncertainty)")
-    print("  4. Fusion + Output Heads")
-    print("="*80 + "\n")
-    
-    return model, optimizer, loss_fn, train_step, backtester
+    return model, optimizer, loss_fn
 
-
-if __name__ == "__main__":
-    model, optimizer, loss_fn, train_step, backtester = build_model_and_train()
-    print("✓ Model ready for training!")
