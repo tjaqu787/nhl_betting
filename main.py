@@ -59,31 +59,16 @@ def run_training():
         print("TODO: Load from database - data/nhl_data.db")
         print("For now using mock data...\n")
         
-        # Mock data for testing
-        game_logs = pd.DataFrame({
-            'game_id': range(100),
-            'game_date': pd.date_range('2024-01-01', periods=100),
-            'home_team': ['TOR'] * 100,
-            'away_team': ['MTL'] * 100,
-            'home_score': [3] * 100,
-            'away_score': [2] * 100,
-        })
+       
         
-        preprocessor.fit_player_vocab(game_logs)
-        print(f"✓ Loaded {len(game_logs)} games")
+        preprocessor.fit_player_vocab(5)
         
         print("\nStep 3: Train model")
         print("-" * 40)
         print("Starting walk-forward training...")
         print("(Set epochs_per_window=1 for quick debug)\n")
         
-        orchestrator.train_walk_forward(
-            preprocessor=preprocessor,
-            game_logs=game_logs,
-            train_window_months=6,
-            val_window_months=1,
-            epochs_per_window=1  # Set to 1 for quick debug
-        )
+        orchestrator.run_full_curriculum(data_loader)
         
         print("✓ Training complete (currently stubbed)")
         print("\n" + "="*80)
