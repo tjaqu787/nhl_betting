@@ -54,6 +54,45 @@ class TrainingOrchestrator:
         self.best_val_sharpe = -float('inf')
         self.best_val_loss = float('inf')
         
+        self.phases = [
+            TrainingPhase(
+                name="early_modern",
+                start_date="2010-01-01",
+                end_date="2015-12-31",
+                num_epochs=8,
+                description="Early modern era - build foundation"
+            ),
+            TrainingPhase(
+                name="recent_past",
+                start_date="2016-01-01",
+                end_date="2020-12-31",
+                num_epochs=6,
+                description="Recent past - more data, refine"
+            ),
+            TrainingPhase(
+                name="covid_era",
+                start_date="2021-01-01",
+                end_date="2022-12-31",
+                num_epochs=4,
+                description="COVID era - adapt to changes"
+            ),
+            TrainingPhase(
+                name="current_era",
+                start_date="2023-01-01",
+                end_date="2024-12-31",
+                num_epochs=3,
+                description="Current era - latest patterns"
+            ),
+            TrainingPhase(
+                name="final_validation",
+                start_date="2024-01-01",
+                end_date="2025-12-31",
+                num_epochs=1,
+                is_validation=True,
+                description="Final validation - hold-out test"
+            )
+        ]
+        '''
         # Define curriculum phases
         self.phases = [
             TrainingPhase(
@@ -93,10 +132,12 @@ class TrainingOrchestrator:
                 description="Recent seasons - validation only"
             )
         ]
+        '''
+
     
     def create_training_step(self):
         """Create optimized training step with all heads"""
-        @tf.function
+        #@tf.function
         def train_step(inputs, targets):
             with tf.GradientTape() as tape:
                 predictions = self.model(inputs, training=True)
@@ -597,7 +638,7 @@ class TrainingOrchestrator:
 # HELPER: DATA LOADER
 # ============================================================================
 
-def create_data_loader(preprocessor, db_path="nhl_data.db"):
+def create_data_loader(preprocessor, db_path="data/nhl_data.db"):
     """
     Create data loader function for training orchestrator.
     
