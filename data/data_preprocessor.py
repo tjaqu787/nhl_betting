@@ -16,15 +16,16 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from data.queries import (
+    create_rolling_features_table,
     get_training_data,
     get_team_rolling_window,
     get_player_rolling_window,
     get_team_game_rolling_window,
     get_h2h_rolling_window,
-    get_rest_days_rolling_window,
     db_path
 )
 
+create_rolling_features_table(lookback_games=10)
 
 # ============================================================================
 # 1. NHL DATA PREPROCESSOR
