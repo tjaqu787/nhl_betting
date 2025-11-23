@@ -63,6 +63,11 @@ def run_training():
         
         preprocessor.fit_player_vocab(5)
         
+        # Create data loader function
+        from utils.training import create_data_loader
+        data_loader = create_data_loader(preprocessor, db_path="data/nhl_data.db")
+        print("✓ Data loader created")
+        
         print("\nStep 3: Train model")
         print("-" * 40)
         print("Starting walk-forward training...")
@@ -202,13 +207,6 @@ def run_inference():
             # TODO: Prepare features and run inference
             # features = preprocessor.prepare_game_features(game)
             # prediction = model.predict(features)
-            
-            print(f"  TODO: Generate prediction")
-            print(f"  Predicted home win prob: 0.XX")
-            print(f"  Predicted spread: ±X.X")
-            print(f"  Edge vs market: +X.X%")
-            print(f"  Bet recommendation: [PASS/BET HOME/BET AWAY]")
-        
         print("\n" + "="*80)
         print("INFERENCE COMPLETE")
         print("="*80)
