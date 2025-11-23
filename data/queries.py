@@ -8,7 +8,7 @@ import pandas as pd
 from typing import Optional
 
 
-db_path = "nhl_data.db"
+db_path = "data/nhl_data.db"
     
 def get_training_data( 
                         start_date: Optional[str] = None,

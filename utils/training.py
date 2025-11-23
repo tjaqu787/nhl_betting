@@ -139,6 +139,7 @@ class TrainingOrchestrator:
         """Create optimized training step with all heads"""
         #@tf.function
         def train_step(inputs, targets):
+            print('uncomment #@tf.function')
             with tf.GradientTape() as tape:
                 predictions = self.model(inputs, training=True)
                 

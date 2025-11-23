@@ -8,7 +8,7 @@ import time
 class NHLDataScraper:
     BASE_URL = "https://api-web.nhle.com/v1"
     
-    def __init__(self, db_path: str = "nhl_data.db"):
+    def __init__(self, db_path: str = "data/nhl_data.db"):
         self.db_path = db_path
         self.conn = None
         self.session = requests.Session()
