@@ -166,7 +166,7 @@ class NHLDataScraper:
         
         # View 1: Team rolling stats (last N games as of any date)
         cursor.execute("""
-            CREATE VIEW IF NOT EXISTS team_rolling_stats AS
+            CREATE VIEW IF NOT EXISTS team_rolling_stats_view AS
             WITH game_results AS (
                 SELECT 
                     game_id,
@@ -228,7 +228,7 @@ class NHLDataScraper:
         
         # View 2: Team form as of any date (last N games)
         cursor.execute("""
-            CREATE VIEW IF NOT EXISTS team_form AS
+            CREATE VIEW IF NOT EXISTS team_form_view AS
             SELECT 
                 t1.team,
                 t1.game_date as as_of_date,
@@ -254,7 +254,7 @@ class NHLDataScraper:
         
         # View 3: Head-to-head records as of any date
         cursor.execute("""
-            CREATE VIEW IF NOT EXISTS head_to_head AS
+            CREATE VIEW IF NOT EXISTS head_to_head_view AS
             SELECT 
                 t1.team as team_a,
                 t1.opponent as team_b,
@@ -273,7 +273,7 @@ class NHLDataScraper:
         
         # View 4: Player form (last N games)
         cursor.execute("""
-            CREATE VIEW IF NOT EXISTS player_form AS
+            CREATE VIEW IF NOT EXISTS player_form_view AS
             SELECT 
                 pgs1.player_id,
                 g1.game_date as as_of_date,
@@ -298,7 +298,7 @@ class NHLDataScraper:
         
         # View 5: Rest days (days between games)
         cursor.execute("""
-            CREATE VIEW IF NOT EXISTS team_rest_days AS
+            CREATE VIEW IF NOT EXISTS team_rest_days_view AS
             WITH team_games AS (
                 SELECT team, game_date, game_id,
                     LAG(game_date) OVER (PARTITION BY team ORDER BY game_date) as prev_game_date
@@ -321,7 +321,7 @@ class NHLDataScraper:
         
         # View 6: Streak tracking
         cursor.execute("""
-            CREATE VIEW IF NOT EXISTS team_streaks AS
+            CREATE VIEW IF NOT EXISTS team_streaks_view AS
             WITH game_outcomes AS (
                 SELECT 
                     team,
@@ -806,15 +806,6 @@ def main():
         print("Data Collection Complete!")
         print("="*60)
         print(f"\nDatabase: {scraper.db_path}")
-        print("\nAvailable feature views:")
-        print("  - team_rolling_stats: Per-game stats for all teams")
-        print("  - team_form: Aggregated form over last N days")
-        print("  - head_to_head: H2H records between teams")
-        print("  - player_form: Player performance over last N games")
-        print("  - team_rest_days: Days of rest between games")
-        print("  - team_streaks: Win/loss streak tracking")
-        print("\nExample query:")
-        print("  SELECT * FROM team_form WHERE team = 'TOR' AND as_of_date = '2024-10-20';")
         
     except KeyboardInterrupt:
         print("\n\n✗ Interrupted by user")
