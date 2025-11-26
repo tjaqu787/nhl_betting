@@ -4,6 +4,7 @@ import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 import time
+import schema
 
 class NHLDataScraper:
     BASE_URL = "https://api-web.nhle.com/v1"
@@ -16,7 +17,6 @@ class NHLDataScraper:
             'User-Agent': 'NHL-Data-Scraper/1.0'
         })
         self.setup_database()
-        self.create_feature_views()
     
     def _get(self, endpoint: str, params: Optional[Dict] = None) -> Optional[Dict]:
         """Make GET request to NHL API"""
@@ -35,318 +35,57 @@ class NHLDataScraper:
         cursor = self.conn.cursor()
         
         # Teams table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS teams (
-                team_abbrev TEXT PRIMARY KEY,
-                team_name TEXT,
-                franchise_id INTEGER,
-                conference TEXT,
-                division TEXT,
-                data_json TEXT,
-                updated_at TIMESTAMP
-            )
-        """)
+        cursor.execute(schema.teams)
         
         # Games table - comprehensive game information
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS games (
-                game_id INTEGER PRIMARY KEY,
-                season TEXT,
-                game_type INTEGER,
-                game_date TEXT,
-                start_time TEXT,
-                home_team TEXT,
-                away_team TEXT,
-                home_score INTEGER,
-                away_score INTEGER,
-                game_state TEXT,
-                period INTEGER,
-                venue TEXT,
-                home_sog INTEGER,
-                away_sog INTEGER,
-                data_json TEXT,
-                updated_at TIMESTAMP
-            )
-        """)
+        cursor.execute(schema.games)
         
         # Player game stats - detailed per-game performance
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS player_game_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                player_id INTEGER,
-                game_id INTEGER,
-                team_abbrev TEXT,
-                position TEXT,
-                goals INTEGER,
-                assists INTEGER,
-                points INTEGER,
-                plus_minus INTEGER,
-                pim INTEGER,
-                shots INTEGER,
-                toi TEXT,
-                powerplay_goals INTEGER,
-                powerplay_assists INTEGER,
-                shorthanded_goals INTEGER,
-                shorthanded_assists INTEGER,
-                game_winning_goals INTEGER,
-                ot_goals INTEGER,
-                faceoff_pct REAL,
-                hits INTEGER,
-                blocked INTEGER,
-                data_json TEXT,
-                updated_at TIMESTAMP,
-                UNIQUE(player_id, game_id)
-            )
-        """)
+        cursor.execute(schema.player_game_stats)
         
         # Team game stats - team-level per-game stats
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS team_game_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                game_id INTEGER,
-                team_abbrev TEXT,
-                is_home INTEGER,
-                goals INTEGER,
-                shots INTEGER,
-                pim INTEGER,
-                powerplay_goals INTEGER,
-                powerplay_opportunities INTEGER,
-                faceoff_win_pct REAL,
-                blocked INTEGER,
-                hits INTEGER,
-                giveaways INTEGER,
-                takeaways INTEGER,
-                data_json TEXT,
-                updated_at TIMESTAMP,
-                UNIQUE(game_id, team_abbrev)
-            )
-        """)
+        cursor.execute(schema.team_game_stats)
         
         # Players table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS players (
-                player_id INTEGER PRIMARY KEY,
-                full_name TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                position TEXT,
-                shoots_catches TEXT,
-                height_inches INTEGER,
-                weight_lbs INTEGER,
-                birth_date TEXT,
-                birth_city TEXT,
-                birth_country TEXT,
-                current_team TEXT,
-                sweater_number INTEGER,
-                headshot_url TEXT,
-                data_json TEXT,
-                updated_at TIMESTAMP
-            )
-        """)
+        cursor.execute(schema.players)
         
         # Rosters table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS rosters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                team_abbrev TEXT,
-                player_id INTEGER,
-                season TEXT,
-                position_code TEXT,
-                last_updated TIMESTAMP,
-                UNIQUE(team_abbrev, player_id, season)
-            )
-        """)
+        cursor.execute(schema.rosters)
         
+        # Plays Table
+        cursor.execute(schema.plays)
+
+        # View 1: Team rolling stats (last N games as of any date)
+        cursor.execute(schema.team_rolling_stats_view)
+        
+        # View 2: Team form as of any date (last N games)
+        cursor.execute(schema.team_form_view)
+        
+        # View 3: Head-to-head records as of any date
+        cursor.execute(schema.head_to_head_view)
+        
+        # View 4: Player form (last N games)
+        cursor.execute(schema.player_form_view)
+        
+        # View 5: Rest days (days between games)
+        cursor.execute(schema.team_rest_days_view)
+        
+        # View 6: Streak tracking
+        cursor.execute(schema.team_streaks_view)
+        
+        # Create table
+        print('creating cumulative stats')
+        #cursor.execute(schema.player_cumulative_stats)
+        
+        # creat indexs
+        for index in schema.indexs:
+            cursor.execute(index)
+
+
         self.conn.commit()
         print(f"✓ Database initialized at {self.db_path}")
     
-    def create_feature_views(self):
-        """Create SQL views for feature engineering"""
-        cursor = self.conn.cursor()
-        
-        # View 1: Team rolling stats (last N games as of any date)
-        cursor.execute("""
-            CREATE VIEW IF NOT EXISTS team_rolling_stats_view AS
-            WITH game_results AS (
-                SELECT 
-                    game_id,
-                    game_date,
-                    season,
-                    home_team as team,
-                    away_team as opponent,
-                    1 as is_home,
-                    CASE 
-                        WHEN home_score > away_score THEN 1 
-                        WHEN home_score < away_score THEN 0
-                        ELSE 0.5  -- Overtime/shootout loss
-                    END as win,
-                    home_score as goals_for,
-                    away_score as goals_against,
-                    home_sog as shots_for,
-                    away_sog as shots_against
-                FROM games
-                WHERE game_state IN ('OFF', 'FINAL')
-                
-                UNION ALL
-                
-                SELECT 
-                    game_id,
-                    game_date,
-                    season,
-                    away_team as team,
-                    home_team as opponent,
-                    0 as is_home,
-                    CASE 
-                        WHEN away_score > home_score THEN 1 
-                        WHEN away_score < home_score THEN 0
-                        ELSE 0.5
-                    END as win,
-                    away_score as goals_for,
-                    home_score as goals_against,
-                    away_sog as shots_for,
-                    home_sog as shots_against
-                FROM games
-                WHERE game_state IN ('OFF', 'FINAL')
-            )
-            SELECT 
-                team,
-                game_date,
-                season,
-                game_id,
-                is_home,
-                opponent,
-                win,
-                goals_for,
-                goals_against,
-                shots_for,
-                shots_against,
-                goals_for - goals_against as goal_differential,
-                CASE WHEN shots_for > 0 THEN CAST(goals_for AS REAL) / shots_for ELSE 0 END as shooting_pct,
-                CASE WHEN shots_against > 0 THEN 1.0 - CAST(goals_against AS REAL) / shots_against ELSE 0 END as save_pct
-            FROM game_results
-        """)
-        
-        # View 2: Team form as of any date (last N games)
-        cursor.execute("""
-            CREATE VIEW IF NOT EXISTS team_form_view AS
-            SELECT 
-                t1.team,
-                t1.game_date as as_of_date,
-                COUNT(*) as games_played,
-                SUM(t2.win) as wins,
-                AVG(t2.goals_for) as avg_goals_for,
-                AVG(t2.goals_against) as avg_goals_against,
-                AVG(t2.goal_differential) as avg_goal_diff,
-                AVG(t2.shots_for) as avg_shots_for,
-                AVG(t2.shots_against) as avg_shots_against,
-                AVG(t2.shooting_pct) as avg_shooting_pct,
-                AVG(t2.save_pct) as avg_save_pct,
-                SUM(CASE WHEN t2.is_home = 1 THEN t2.win ELSE 0 END) as home_wins,
-                SUM(CASE WHEN t2.is_home = 1 THEN 1 ELSE 0 END) as home_games,
-                SUM(CASE WHEN t2.is_home = 0 THEN t2.win ELSE 0 END) as away_wins,
-                SUM(CASE WHEN t2.is_home = 0 THEN 1 ELSE 0 END) as away_games
-            FROM team_rolling_stats t1
-            JOIN team_rolling_stats t2 ON t1.team = t2.team 
-                AND t2.game_date <= t1.game_date
-                AND t2.game_date > date(t1.game_date, '-30 days')
-            GROUP BY t1.team, t1.game_date
-        """)
-        
-        # View 3: Head-to-head records as of any date
-        cursor.execute("""
-            CREATE VIEW IF NOT EXISTS head_to_head_view AS
-            SELECT 
-                t1.team as team_a,
-                t1.opponent as team_b,
-                t1.game_date as as_of_date,
-                COUNT(*) as games_played,
-                SUM(t2.win) as team_a_wins,
-                AVG(t2.goals_for) as team_a_avg_goals,
-                AVG(t2.goals_against) as team_b_avg_goals
-            FROM team_rolling_stats t1
-            JOIN team_rolling_stats t2 ON t1.team = t2.team 
-                AND t1.opponent = t2.opponent
-                AND t2.game_date <= t1.game_date
-                AND t2.game_date > date(t1.game_date, '-365 days')
-            GROUP BY t1.team, t1.opponent, t1.game_date
-        """)
-        
-        # View 4: Player form (last N games)
-        cursor.execute("""
-            CREATE VIEW IF NOT EXISTS player_form_view AS
-            SELECT 
-                pgs1.player_id,
-                g1.game_date as as_of_date,
-                COUNT(*) as games_played,
-                AVG(pgs2.goals) as avg_goals,
-                AVG(pgs2.assists) as avg_assists,
-                AVG(pgs2.points) as avg_points,
-                AVG(pgs2.shots) as avg_shots,
-                AVG(pgs2.plus_minus) as avg_plus_minus,
-                SUM(pgs2.powerplay_goals) as total_pp_goals,
-                SUM(pgs2.game_winning_goals) as total_gwg
-            FROM player_game_stats pgs1
-            JOIN games g1 ON pgs1.game_id = g1.game_id
-            JOIN player_game_stats pgs2 ON pgs1.player_id = pgs2.player_id
-            JOIN games g2 ON pgs2.game_id = g2.game_id
-            WHERE g2.game_date <= g1.game_date
-                AND g2.game_date > date(g1.game_date, '-30 days')
-                AND g1.game_state IN ('OFF', 'FINAL')
-                AND g2.game_state IN ('OFF', 'FINAL')
-            GROUP BY pgs1.player_id, g1.game_date
-        """)
-        
-        # View 5: Rest days (days between games)
-        cursor.execute("""
-            CREATE VIEW IF NOT EXISTS team_rest_days_view AS
-            WITH team_games AS (
-                SELECT team, game_date, game_id,
-                    LAG(game_date) OVER (PARTITION BY team ORDER BY game_date) as prev_game_date
-                FROM (
-                    SELECT home_team as team, game_date, game_id FROM games WHERE game_state IN ('OFF', 'FINAL')
-                    UNION ALL
-                    SELECT away_team as team, game_date, game_id FROM games WHERE game_state IN ('OFF', 'FINAL')
-                )
-            )
-            SELECT 
-                team,
-                game_date,
-                game_id,
-                CASE 
-                    WHEN prev_game_date IS NULL THEN NULL
-                    ELSE CAST(julianday(game_date) - julianday(prev_game_date) AS INTEGER)
-                END as rest_days
-            FROM team_games
-        """)
-        
-        # View 6: Streak tracking
-        cursor.execute("""
-            CREATE VIEW IF NOT EXISTS team_streaks_view AS
-            WITH game_outcomes AS (
-                SELECT 
-                    team,
-                    game_date,
-                    game_id,
-                    CASE 
-                        WHEN win = 1 THEN 'W'
-                        WHEN win = 0 THEN 'L'
-                        ELSE 'O'
-                    END as outcome,
-                    ROW_NUMBER() OVER (PARTITION BY team ORDER BY game_date) as game_num
-                FROM team_rolling_stats
-            )
-            SELECT 
-                team,
-                game_date,
-                game_id,
-                outcome,
-                game_num
-            FROM game_outcomes
-        """)
-        
-        self.conn.commit()
-        print("✓ Feature engineering views created")
-    
+
     def fetch_schedule(self, date: str) -> int:
         """Fetch schedule for a specific date (YYYY-MM-DD)"""
         # Using /score endpoint which returns games with basic info + scores
@@ -444,6 +183,25 @@ class NHLDataScraper:
         if 'plays' in data:
             for play in data['plays']:
                 play_type = play.get('typeDescKey')
+                period_desc = play.get('periodDescriptor', {})
+                
+                cursor.execute("""
+                    INSERT OR REPLACE INTO plays VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    None,  # play_id (autoincrement)
+                    game_id,
+                    play.get('eventId'),
+                    period_desc.get('number'),
+                    period_desc.get('periodType'),
+                    play.get('timeInPeriod'),
+                    play.get('timeRemaining'),
+                    play.get('typeCode'),
+                    play.get('typeDescKey'),
+                    play.get('sortOrder'),
+                    json.dumps(play.get('details', {})),
+                    datetime.now()
+                ))
+        
                 
                 # Track shots on goal
                 if play_type == 'shot-on-goal' and 'details' in play:
@@ -484,7 +242,7 @@ class NHLDataScraper:
         for player_id, stats in player_stats.items():
             cursor.execute("""
                 INSERT OR REPLACE INTO player_game_stats VALUES (
-                    NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
             """, (
                 player_id,
@@ -502,15 +260,13 @@ class NHLDataScraper:
                 None,  # powerplay_assists
                 None,  # shorthanded_goals
                 None,  # shorthanded_assists
-                None,  # game_winning_goals
                 None,  # ot_goals
                 None,  # faceoff_pct
-                None,  # hits
-                None,  # blocked
                 json.dumps({'team_id': stats['team'], **stats}),
                 datetime.now()
             ))
-        
+            # Store all plays
+
         self.conn.commit()
         return True
     
